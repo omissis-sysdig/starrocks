@@ -71,11 +71,10 @@ public class ExecuteExceptionHandler {
     private static final Set<String> SCHEMA_NOT_MATCH_ERROR = ImmutableSet.of("invalid field name");
 
     // A CN switched to a newer dictionary version after the FE planned the query. A new plan uses the new version.
-    // "verison" is the BE spelling; keep "version" in case the BE fixes it.
-    private static final Set<String> DICTIONARY_VERSION_NOT_FOUND_ERROR =
-            ImmutableSet.of("can not found dictionary by verison", "can not found dictionary by version");
-    private static final Pattern DICTIONARY_VERSION_NOT_FOUND_PATTERN =
-            Pattern.compile("can not found dictionary by ver(?:ison|sion): (\\d+),.*dictionary id: (\\d+)");
+    // "verison" is the BE spelling; keep "version" in case the BE fixes it. The version and id are optional,
+    // so a change in the rest of the BE text still retries, only without the wait.
+    private static final Pattern DICTIONARY_VERSION_NOT_FOUND_ERROR =
+            Pattern.compile("can not found dictionary by ver(?:ison|sion)(?:: (\\d+),.*dictionary id: (\\d+))?");
 
     public static void handle(Exception e, RetryContext context) throws Exception {
         if (e instanceof RemoteFileNotFoundException) {
@@ -359,11 +358,10 @@ public class ExecuteExceptionHandler {
                     return;
                 }
             }
-            for (String errMsg : DICTIONARY_VERSION_NOT_FOUND_ERROR) {
-                if (msg.contains(errMsg)) {
-                    handleDictionaryVersionNotFound(e, context);
-                    return;
-                }
+            Matcher dictionaryVersionNotFound = DICTIONARY_VERSION_NOT_FOUND_ERROR.matcher(msg);
+            if (dictionaryVersionNotFound.find()) {
+                handleDictionaryVersionNotFound(e, context, dictionaryVersionNotFound);
+                return;
             }
             // if it is cancelled due to backend not alive, rebuild the plan and retry again
             if (e.getInternalErrorCode().equals(InternalErrorCode.CANCEL_NODE_NOT_ALIVE_ERR)) {
@@ -376,15 +374,19 @@ public class ExecuteExceptionHandler {
 
     // The FE moves the planned version only after the last CN switched, and a follower FE learns it later
     // from the edit log. Plan again at once and the new plan can carry the same old version.
-    private static void handleDictionaryVersionNotFound(StarRocksException e, RetryContext context)
+    private static void handleDictionaryVersionNotFound(StarRocksException e, RetryContext context, Matcher matcher)
             throws Exception {
-        Matcher matcher = DICTIONARY_VERSION_NOT_FOUND_PATTERN.matcher(e.getMessage());
-        if (matcher.find()) {
+        // Rows already went to the client, so the query cannot run again. Do not make it wait first.
+        if (context.connectContext.getMysqlChannel().isSend()) {
+            throw e;
+        }
+        if (matcher.group(1) != null) {
             long plannedVersion = Long.parseLong(matcher.group(1));
             long dictionaryId = Long.parseLong(matcher.group(2));
             Dictionary dictionary = GlobalStateMgr.getCurrentState().getDictionaryMgr().getDictionaryById(dictionaryId);
             try {
-                waitForDictionaryRefresh(dictionary, plannedVersion, Config.dictionary_version_retry_wait_ms);
+                waitForDictionaryRefresh(dictionary, plannedVersion, GlobalStateMgr.getCurrentState().isLeader(),
+                        Config.dictionary_version_retry_wait_ms);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 throw e;
@@ -393,12 +395,15 @@ public class ExecuteExceptionHandler {
         rebuildExecPlan(e, context);
     }
 
+    // The leader knows when a refresh is over. A follower may not have replayed the refresh yet,
+    // so it waits until its version changes, even if the dictionary looks idle.
     @VisibleForTesting
-    static void waitForDictionaryRefresh(Dictionary dictionary, long plannedVersion, long timeoutMs)
+    static void waitForDictionaryRefresh(Dictionary dictionary, long plannedVersion, boolean isLeader, long timeoutMs)
             throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;
-        while (dictionary != null && dictionary.isRefreshingFromVersion(plannedVersion)
-                && System.currentTimeMillis() < deadline) {
+        while (dictionary != null && System.currentTimeMillis() < deadline
+                && (isLeader ? dictionary.isRefreshingFromVersion(plannedVersion)
+                        : dictionary.plansWithVersion(plannedVersion))) {
             Thread.sleep(20);
         }
     }

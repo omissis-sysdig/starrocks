@@ -15,11 +15,14 @@
 package com.starrocks.qe;
 
 import com.starrocks.catalog.Dictionary;
+import com.starrocks.catalog.DictionaryMgr;
+import com.starrocks.common.Config;
 import com.starrocks.common.ExceptionChecker;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.InternalErrorCode;
 import com.starrocks.common.StarRocksException;
 import com.starrocks.connector.exception.RemoteFileNotFoundException;
+import com.starrocks.mysql.MysqlChannel;
 import com.starrocks.planner.RangeColocateUnalignedException;
 import com.starrocks.rpc.RpcException;
 import com.starrocks.sql.ast.StatementBase;
@@ -27,10 +30,13 @@ import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.sql.plan.ConnectorPlanTestBase;
 import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.sql.plan.PlanTestBase;
+import mockit.Mock;
+import mockit.MockUp;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -156,7 +162,9 @@ public class ExecuteExceptionHandlerTest extends PlanTestBase {
                 "open dictionary expression failed can not found dictionary by verison: 98101, "
                         + "dictionary maybe dropped or updated, dictionary id: 5 backend [id=24305]",
                 "open dictionary expression failed can not found dictionary by version: 98101, "
-                        + "dictionary maybe dropped or updated, dictionary id: 5 backend [id=24305]"};
+                        + "dictionary maybe dropped or updated, dictionary id: 5 backend [id=24305]",
+                // A changed BE text with no version or id still retries, only without the wait.
+                "open dictionary expression failed can not found dictionary by verison"};
         for (String message : messages) {
             ExecPlan execPlan = getExecPlan(sql);
             ExecuteExceptionHandler.RetryContext retryContext =
@@ -179,6 +187,10 @@ public class ExecuteExceptionHandlerTest extends PlanTestBase {
                 retryContext));
     }
 
+    private static final String VERSION_NOT_FOUND_MESSAGE =
+            "open dictionary expression failed can not found dictionary by verison: 98100, "
+                    + "dictionary maybe dropped or updated, dictionary id: 5 backend [id=24305]";
+
     private static Dictionary newCommittingDictionary(long lastSuccessVersion) {
         Dictionary dictionary = new Dictionary(5, "dict", "t", "default_catalog", "testDb",
                 List.of("k"), List.of("v"), null);
@@ -188,22 +200,88 @@ public class ExecuteExceptionHandlerTest extends PlanTestBase {
         return dictionary;
     }
 
-    @Test
-    public void testWaitForDictionaryRefreshEndsWhenCommitFinishes() throws Exception {
-        Dictionary dictionary = newCommittingDictionary(98100);
+    private static Thread finishLater(Dictionary dictionary, long version) {
         Thread finisher = new Thread(() -> {
             try {
                 Thread.sleep(100);
             } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
             }
-            dictionary.setFinished(System.currentTimeMillis(), 98101);
+            dictionary.setFinished(System.currentTimeMillis(), version);
         });
         finisher.start();
+        return finisher;
+    }
+
+    @Test
+    public void testRetryWaitsForTheDictionaryInTheError() throws Exception {
+        Dictionary dictionary = newCommittingDictionary(98100);
+        AtomicLong askedId = new AtomicLong(-1);
+        new MockUp<DictionaryMgr>() {
+            @Mock
+            public Dictionary getDictionaryById(long dictionaryId) {
+                askedId.set(dictionaryId);
+                return dictionary;
+            }
+        };
+        long oldWaitMs = Config.dictionary_version_retry_wait_ms;
+        Config.dictionary_version_retry_wait_ms = 10000;
+        try {
+            String sql = "select * from t0";
+            StatementBase statementBase = SqlParser.parse(sql, connectContext.getSessionVariable()).get(0);
+            ExecPlan execPlan = getExecPlan(sql);
+            ExecuteExceptionHandler.RetryContext retryContext =
+                    new ExecuteExceptionHandler.RetryContext(0, execPlan, connectContext, statementBase);
+            Thread finisher = finishLater(dictionary, 98101);
+            long start = System.currentTimeMillis();
+            ExceptionChecker.expectThrowsNoException(() -> ExecuteExceptionHandler.handle(
+                    new StarRocksException(VERSION_NOT_FOUND_MESSAGE), retryContext));
+            long elapsed = System.currentTimeMillis() - start;
+            finisher.join();
+            // The id and the version come from the error text: a wrong parse does not wait for the finisher.
+            Assertions.assertEquals(5, askedId.get());
+            Assertions.assertTrue(elapsed >= 100, "waited " + elapsed + " ms");
+            Assertions.assertTrue(elapsed < 2000, "waited " + elapsed + " ms");
+            Assertions.assertNotEquals(retryContext.getExecPlan(), execPlan);
+        } finally {
+            Config.dictionary_version_retry_wait_ms = oldWaitMs;
+        }
+    }
+
+    @Test
+    public void testNoWaitOnDictionaryVersionNotFoundAfterRowsWereSent() throws Exception {
+        new MockUp<MysqlChannel>() {
+            @Mock
+            public boolean isSend() {
+                return true;
+            }
+        };
+        new MockUp<DictionaryMgr>() {
+            @Mock
+            public Dictionary getDictionaryById(long dictionaryId) {
+                return newCommittingDictionary(98100);
+            }
+        };
+        String sql = "select * from t0";
+        StatementBase statementBase = SqlParser.parse(sql, connectContext.getSessionVariable()).get(0);
+        ExecPlan execPlan = getExecPlan(sql);
+        ExecuteExceptionHandler.RetryContext retryContext =
+                new ExecuteExceptionHandler.RetryContext(0, execPlan, connectContext, statementBase);
         long start = System.currentTimeMillis();
-        ExecuteExceptionHandler.waitForDictionaryRefresh(dictionary, 98100, 10000);
+        Assertions.assertThrows(StarRocksException.class, () -> ExecuteExceptionHandler.handle(
+                new StarRocksException(VERSION_NOT_FOUND_MESSAGE), retryContext));
+        Assertions.assertTrue(System.currentTimeMillis() - start < 1000);
+        Assertions.assertEquals(retryContext.getExecPlan(), execPlan);
+    }
+
+    @Test
+    public void testWaitForDictionaryRefreshEndsWhenCommitFinishes() throws Exception {
+        Dictionary dictionary = newCommittingDictionary(98100);
+        Thread finisher = finishLater(dictionary, 98101);
+        long start = System.currentTimeMillis();
+        ExecuteExceptionHandler.waitForDictionaryRefresh(dictionary, 98100, true, 10000);
         finisher.join();
-        Assertions.assertTrue(System.currentTimeMillis() - start < 10000);
+        Assertions.assertTrue(System.currentTimeMillis() - start < 2000);
         Assertions.assertEquals(98101, dictionary.getLastSuccessVersion());
     }
 
@@ -211,7 +289,7 @@ public class ExecuteExceptionHandlerTest extends PlanTestBase {
     public void testWaitForDictionaryRefreshIsBounded() throws Exception {
         Dictionary dictionary = newCommittingDictionary(98100);
         long start = System.currentTimeMillis();
-        ExecuteExceptionHandler.waitForDictionaryRefresh(dictionary, 98100, 100);
+        ExecuteExceptionHandler.waitForDictionaryRefresh(dictionary, 98100, true, 100);
         Assertions.assertTrue(System.currentTimeMillis() - start >= 100);
         Assertions.assertTrue(dictionary.isRefreshing());
     }
@@ -220,9 +298,28 @@ public class ExecuteExceptionHandlerTest extends PlanTestBase {
     public void testWaitForDictionaryRefreshSkipsWhenNotNeeded() throws Exception {
         long start = System.currentTimeMillis();
         // The FE already plans with a newer version than the failed query.
-        ExecuteExceptionHandler.waitForDictionaryRefresh(newCommittingDictionary(98101), 98100, 10000);
+        ExecuteExceptionHandler.waitForDictionaryRefresh(newCommittingDictionary(98101), 98100, true, 10000);
+        ExecuteExceptionHandler.waitForDictionaryRefresh(newCommittingDictionary(98101), 98100, false, 10000);
         // The FE does not know the dictionary.
-        ExecuteExceptionHandler.waitForDictionaryRefresh(null, 98100, 10000);
-        Assertions.assertTrue(System.currentTimeMillis() - start < 10000);
+        ExecuteExceptionHandler.waitForDictionaryRefresh(null, 98100, true, 10000);
+        // The leader sees that no refresh runs, so no newer version can come.
+        Dictionary idle = newCommittingDictionary(98100);
+        idle.setCancelled();
+        ExecuteExceptionHandler.waitForDictionaryRefresh(idle, 98100, true, 10000);
+        Assertions.assertTrue(System.currentTimeMillis() - start < 1000);
+    }
+
+    @Test
+    public void testFollowerWaitsForAnIdleDictionaryToChangeVersion() throws Exception {
+        // A follower that did not replay the refresh yet sees the old version as FINISHED.
+        Dictionary dictionary = newCommittingDictionary(98100);
+        dictionary.setFinished(System.currentTimeMillis(), 98100);
+        Thread finisher = finishLater(dictionary, 98101);
+        long start = System.currentTimeMillis();
+        ExecuteExceptionHandler.waitForDictionaryRefresh(dictionary, 98100, false, 10000);
+        long elapsed = System.currentTimeMillis() - start;
+        finisher.join();
+        Assertions.assertTrue(elapsed >= 100, "waited " + elapsed + " ms");
+        Assertions.assertTrue(elapsed < 2000, "waited " + elapsed + " ms");
     }
 }

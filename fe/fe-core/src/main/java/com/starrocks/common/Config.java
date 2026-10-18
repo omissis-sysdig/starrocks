@@ -4425,6 +4425,8 @@ public class Config extends ConfigBase {
     /**
      * Before a query that failed on a dictionary version mismatch is planned again, wait at most this long
      * for the dictionary refresh that caused it to finish. 0 means plan again at once.
+     * A follower FE can lag behind the leader, so it waits until its planned version changes.
+     * A query retries max_query_retry_time - 1 times, so with the default of 2 it waits once.
      */
     @ConfField(mutable = true)
     public static long dictionary_version_retry_wait_ms = 2000;

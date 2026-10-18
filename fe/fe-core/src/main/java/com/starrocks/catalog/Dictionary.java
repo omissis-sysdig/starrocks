@@ -393,6 +393,10 @@ public class Dictionary implements Writable {
         return isRefreshing() && this.lastSuccessVersion == version;
     }
 
+    public synchronized boolean plansWithVersion(long version) {
+        return this.lastSuccessVersion == version;
+    }
+
     public synchronized void resetStateBeforeRefresh() {
         if (this.stateBeforeRefresh != null) {
             this.state = this.stateBeforeRefresh;
