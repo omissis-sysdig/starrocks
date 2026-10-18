@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -231,6 +232,17 @@ public:
                                                 int64_t base_version, int64_t new_version,
                                                 std::unique_ptr<std::lock_guard<std::shared_timed_mutex>>& lock);
 
+    // True if a publish failed because the PK index points at a segment the tablet no longer has.
+    static bool is_missing_rssid_error(const Status& st);
+
+    // Asks the next publish of `tablet_id` from `base_version` to rebuild the PK index from segments.
+    // Returns false when an automatic rebuild from this base version already ran, so a rebuild that
+    // does not help is not repeated.
+    bool request_pk_index_rebuild(int64_t tablet_id, int64_t base_version);
+
+    // Returns true once for a rebuild requested at `base_version`.
+    bool take_pk_index_rebuild_request(int64_t tablet_id, int64_t base_version);
+
     DynamicCache<uint64_t, LakePrimaryIndex>& index_cache() { return _index_cache; }
 
     void lock_shard_pk_index_shard(int64_t tablet_id) { _get_pk_index_shard_lock(tablet_id).lock_shared(); }
@@ -311,6 +323,9 @@ private:
     bool _use_light_publish_primary_compaction(TabletManager* mgr, const TxnLogPB_OpCompaction& op_compaction,
                                                int64_t tablet_id, int64_t txn_id);
 
+    Status _flush_index_before_dropping_dels(bool inputs_have_dels, const TabletMetadataPtr& metadata,
+                                             IndexEntry* index_entry);
+
     static const size_t kPrintMemoryStatsInterval = 300; // 5min
 private:
     // default 6min
@@ -335,6 +350,11 @@ private:
     std::vector<PkIndexShard> _pk_index_shards;
 
     std::unique_ptr<PersistentIndexBlockCache> _block_cache;
+
+    // Both map tablet id -> base version.
+    std::mutex _pk_index_rebuild_mutex;
+    std::unordered_map<int64_t, int64_t> _pk_index_rebuild_requests;
+    std::unordered_map<int64_t, int64_t> _pk_index_auto_rebuilt;
 };
 
 } // namespace lake
