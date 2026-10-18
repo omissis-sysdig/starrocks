@@ -66,6 +66,7 @@ import com.starrocks.sql.parser.ParsingException;
 import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.system.Backend;
 import com.starrocks.system.ComputeNode;
+import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TStatusCode;
 import com.starrocks.thrift.TUniqueId;
@@ -99,6 +100,10 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
     private Set<Long> unfinishedRefreshTasks = Sets.newHashSet();
     private final Set<Long> runningRefreshTasks = Sets.newHashSet();
 
+    // Leader memory only. For each dictionary: the nodes that committed the current version, with their start time.
+    private final Map<Long, Map<TNetworkAddress, Long>> syncedNodeStartTimes = new HashMap<>();
+    private final Map<Long, Long> lastNodeResyncTime = new HashMap<>();
+
     private final Lock lock = new ReentrantLock();
 
     private final ExecutorService executor =
@@ -118,6 +123,8 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
 
             List<UpdateDictionaryLog> updateDictionaryLogList = Lists.newArrayList();
             long ts = System.currentTimeMillis();
+            Map<TNetworkAddress, Long> availableNodes =
+                    dictionariesMapById.isEmpty() ? Map.of() : getAvailableNodeStartTimes();
             for (Map.Entry<Long, Dictionary> entry : dictionariesMapById.entrySet()) {
                 long id = entry.getKey();
                 Dictionary dictionary = dictionariesMapById.get(id);
@@ -125,7 +132,9 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
                 if ((dictionary.getNextSchedulableTime() <= System.currentTimeMillis() &&
                         !unfinishedRefreshTasks.contains(id)) ||
                         // follower -> leader when dictionary is refreshing.
-                        (dictionary.isRefreshing() && !runningRefreshTasks.contains(id))) {
+                        (dictionary.isRefreshing() && !runningRefreshTasks.contains(id)) ||
+                        // a node has no copy of the current version
+                        needNodeResyncUnlocked(dictionary, availableNodes, ts)) {
                     UpdateDictionaryLog updateDictionaryLog = new UpdateDictionaryLog(id, ts);
                     updateDictionaryLog.setState(Dictionary.DictionaryState.REFRESHING);
                     updateDictionaryLogList.add(updateDictionaryLog);
@@ -175,6 +184,73 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
         for (ComputeNode cn : computeNodes) {
             nodes.add(cn.getBrpcAddress());
         }
+    }
+
+    // The start time of each available node. A new start time means that the node restarted and lost its cache.
+    public static Map<TNetworkAddress, Long> getAvailableNodeStartTimes() {
+        SystemInfoService clusterInfo = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
+        Map<TNetworkAddress, Long> startTimes = new HashMap<>();
+        for (Backend backend : clusterInfo.getAvailableBackends()) {
+            startTimes.put(backend.getBrpcAddress(), backend.getLastStartTime());
+        }
+        for (ComputeNode cn : clusterInfo.getAvailableComputeNodes()) {
+            startTimes.put(cn.getBrpcAddress(), cn.getLastStartTime());
+        }
+        return startTimes;
+    }
+
+    // True if an available node restarted, joined, or missed the last commit. Queries on that node fail
+    // until the next refresh, so refresh now instead of at the next regular time.
+    boolean needNodeResyncUnlocked(Dictionary dictionary, Map<TNetworkAddress, Long> availableNodes, long now) {
+        long id = dictionary.getDictionaryId();
+        if (Config.dictionary_node_resync_min_interval_second < 0 ||
+                dictionary.getState() != Dictionary.DictionaryState.FINISHED ||
+                unfinishedRefreshTasks.contains(id)) {
+            return false;
+        }
+        Map<TNetworkAddress, Long> synced = syncedNodeStartTimes.get(id);
+        if (synced == null) {
+            // No record on a new leader. Take the nodes of now as the base, and do not refresh for that.
+            syncedNodeStartTimes.put(id, new HashMap<>(availableNodes));
+            return false;
+        }
+        Long lastResync = lastNodeResyncTime.get(id);
+        if (lastResync != null && now - lastResync < Config.dictionary_node_resync_min_interval_second * 1000L) {
+            return false;
+        }
+        for (Map.Entry<TNetworkAddress, Long> node : availableNodes.entrySet()) {
+            if (!node.getValue().equals(synced.get(node.getKey()))) {
+                LOG.info("refresh dictionary {} because node {} has no copy of version {}",
+                        dictionary.getDictionaryName(), node.getKey(), dictionary.getLastSuccessVersion());
+                lastNodeResyncTime.put(id, now);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void recordSyncedNodes(long dictionaryId, List<TNetworkAddress> committedNodes,
+                                   Map<TNetworkAddress, Long> nodeStartTimes) {
+        Map<TNetworkAddress, Long> synced = new HashMap<>();
+        for (TNetworkAddress node : committedNodes) {
+            // A node with no start time is left out, so the next check refreshes it.
+            Long startTime = nodeStartTimes.get(node);
+            if (startTime != null) {
+                synced.put(node, startTime);
+            }
+        }
+        lock.lock();
+        try {
+            if (dictionariesMapById.containsKey(dictionaryId)) {
+                syncedNodeStartTimes.put(dictionaryId, synced);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    Map<TNetworkAddress, Long> getSyncedNodeStartTimes(long dictionaryId) {
+        return syncedNodeStartTimes.get(dictionaryId);
     }
 
     public static Pair<Boolean, String> processDictionaryCacheInteranl(PProcessDictionaryCacheRequest request,
@@ -287,6 +363,8 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
         dictionariesMapById.remove(dictionary.getDictionaryId());
         dictionariesIdMapByName.remove(dictionary.getDictionaryName());
         unfinishedRefreshTasks.remove(dictionary.getDictionaryId());
+        syncedNodeStartTimes.remove(dictionary.getDictionaryId());
+        lastNodeResyncTime.remove(dictionary.getDictionaryId());
     }
 
     public void replayDropDictionary(String dictionaryName) {
@@ -639,6 +717,7 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
         private Dictionary dictionary;
         private long txnId;
         private List<TNetworkAddress> beNodes = Lists.newArrayList();
+        private Map<TNetworkAddress, Long> nodeStartTimes = new HashMap<>();
         private boolean error;
         private String errMsg;
 
@@ -652,6 +731,7 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
 
         private void initializeBeNodesAddress() {
             fillBackendsOrComputeNodes(this.beNodes);
+            this.nodeStartTimes = getAvailableNodeStartTimes();
         }
 
         protected void setError(boolean isError, String errMsg) {
@@ -845,6 +925,9 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
 
             GlobalStateMgr.getCurrentState().getEditLog().logModifyDictionaryMgr(
                     new UpdateDictionaryMgrLog(Lists.newArrayList(updateDictionaryLog)), walApplier);
+            if (!error) {
+                recordSyncedNodes(dictionary.getDictionaryId(), beNodes, nodeStartTimes);
+            }
             unresigerRunningAndUnfinised(dictionary.getDictionaryId());
         }
 

@@ -15,6 +15,7 @@
 package com.starrocks.catalog;
 
 import com.google.common.collect.Lists;
+import com.starrocks.common.Config;
 import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.Pair;
 import com.starrocks.persist.DropDictionaryInfo;
@@ -784,6 +785,11 @@ public class DictionaryMgrEditLogTest {
             }
 
             @Mock
+            public Map<TNetworkAddress, Long> getAvailableNodeStartTimes() {
+                return Map.of(NODE_A, 100L, NODE_B, 100L, NODE_C, 100L);
+            }
+
+            @Mock
             public Pair<Boolean, String> processDictionaryCacheInteranl(PProcessDictionaryCacheRequest request,
                                                                         List<TNetworkAddress> beNodes,
                                                                         List<PProcessDictionaryCacheResult> results,
@@ -905,6 +911,90 @@ public class DictionaryMgrEditLogTest {
 
         Assertions.assertEquals(Dictionary.DictionaryState.CANCELLED, dictionary.getState());
         Assertions.assertEquals("all nodes failed", dictionary.getRuntimeErrMsg());
+    }
+
+    // ========== A node that has no copy of the current version ==========
+
+    @Test
+    public void testNodeThatMissedTheCommitIsRefreshedEarly() throws Exception {
+        mockThreeNodes(Set.of(PProcessDictionaryCacheRequestType.COMMIT), Set.of());
+        Dictionary dictionary = createRefreshingDictionary("missed_commit_dict", true);
+        long txnId = masterDictionaryMgr.getAndIncrementTxnIdUnlocked();
+        DictionaryMgr.RefreshDictionaryCacheWorker worker =
+                masterDictionaryMgr.new RefreshDictionaryCacheWorker(dictionary, txnId);
+        worker.begin();
+        worker.commit();
+        worker.finish();
+
+        Assertions.assertEquals(Map.of(NODE_A, 100L, NODE_C, 100L),
+                masterDictionaryMgr.getSyncedNodeStartTimes(dictionary.getDictionaryId()));
+
+        Map<TNetworkAddress, Long> availableNodes = Map.of(NODE_A, 100L, NODE_B, 100L, NODE_C, 100L);
+        long now = System.currentTimeMillis();
+        Assertions.assertTrue(masterDictionaryMgr.needNodeResyncUnlocked(dictionary, availableNodes, now));
+        // The next early refresh waits for dictionary_node_resync_min_interval_second.
+        Assertions.assertFalse(masterDictionaryMgr.needNodeResyncUnlocked(dictionary, availableNodes, now + 1000L));
+        long later = now + Config.dictionary_node_resync_min_interval_second * 1000L;
+        Assertions.assertTrue(masterDictionaryMgr.needNodeResyncUnlocked(dictionary, availableNodes, later));
+    }
+
+    @Test
+    public void testRestartedOrNewNodeIsRefreshedEarly() throws Exception {
+        mockThreeNodes(Set.of(), Set.of());
+        Dictionary dictionary = createRefreshingDictionary("restarted_node_dict", true);
+        long txnId = masterDictionaryMgr.getAndIncrementTxnIdUnlocked();
+        DictionaryMgr.RefreshDictionaryCacheWorker worker =
+                masterDictionaryMgr.new RefreshDictionaryCacheWorker(dictionary, txnId);
+        worker.begin();
+        worker.commit();
+        worker.finish();
+
+        long now = System.currentTimeMillis();
+        Map<TNetworkAddress, Long> sameNodes = Map.of(NODE_A, 100L, NODE_B, 100L, NODE_C, 100L);
+        Assertions.assertFalse(masterDictionaryMgr.needNodeResyncUnlocked(dictionary, sameNodes, now));
+        // A node that is down is not a reason to refresh.
+        Map<TNetworkAddress, Long> nodeDown = Map.of(NODE_A, 100L, NODE_C, 100L);
+        Assertions.assertFalse(masterDictionaryMgr.needNodeResyncUnlocked(dictionary, nodeDown, now));
+
+        Map<TNetworkAddress, Long> restarted = Map.of(NODE_A, 100L, NODE_B, 200L, NODE_C, 100L);
+        Assertions.assertTrue(masterDictionaryMgr.needNodeResyncUnlocked(dictionary, restarted, now));
+
+        TNetworkAddress newNode = new TNetworkAddress("127.0.0.4", 8060);
+        Map<TNetworkAddress, Long> scaledOut = Map.of(NODE_A, 100L, NODE_B, 100L, NODE_C, 100L, newNode, 100L);
+        long later = now + Config.dictionary_node_resync_min_interval_second * 1000L;
+        Assertions.assertTrue(masterDictionaryMgr.needNodeResyncUnlocked(dictionary, scaledOut, later));
+    }
+
+    @Test
+    public void testNoEarlyRefreshWithoutARecordOrWhenTurnedOff() throws Exception {
+        Map<String, String> properties = new HashMap<>();
+        properties.put("dictionary_warm_up", "false");
+        masterDictionaryMgr.createDictionary(createTestDictionaryStmt("no_record_dict", properties),
+                TEST_CATALOG_NAME, TEST_DB_NAME);
+        Dictionary dictionary = masterDictionaryMgr.getDictionaryByName("no_record_dict");
+        long now = System.currentTimeMillis();
+        Map<TNetworkAddress, Long> nodes = Map.of(NODE_A, 100L);
+
+        // Not FINISHED: the regular schedule handles it.
+        Assertions.assertFalse(masterDictionaryMgr.needNodeResyncUnlocked(dictionary, nodes, now));
+
+        // A new leader has no record. It takes the nodes of now as the base.
+        dictionary.setFinished(now, 1L);
+        Assertions.assertFalse(masterDictionaryMgr.needNodeResyncUnlocked(dictionary, nodes, now));
+        Assertions.assertEquals(nodes, masterDictionaryMgr.getSyncedNodeStartTimes(dictionary.getDictionaryId()));
+
+        Map<TNetworkAddress, Long> restarted = Map.of(NODE_A, 200L);
+        int oldInterval = Config.dictionary_node_resync_min_interval_second;
+        try {
+            Config.dictionary_node_resync_min_interval_second = -1;
+            Assertions.assertFalse(masterDictionaryMgr.needNodeResyncUnlocked(dictionary, restarted, now));
+        } finally {
+            Config.dictionary_node_resync_min_interval_second = oldInterval;
+        }
+        Assertions.assertTrue(masterDictionaryMgr.needNodeResyncUnlocked(dictionary, restarted, now));
+
+        masterDictionaryMgr.dropDictionary("no_record_dict", false);
+        Assertions.assertNull(masterDictionaryMgr.getSyncedNodeStartTimes(dictionary.getDictionaryId()));
     }
 }
 

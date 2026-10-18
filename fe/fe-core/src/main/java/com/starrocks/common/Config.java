@@ -4422,6 +4422,14 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true)
     public static int refresh_dictionary_cache_thread_num = 2;
 
+    /**
+     * The leader refreshes a dictionary early when a node restarts, joins, or missed the last commit,
+     * because that node has no copy of the current version. This is the shortest time between two such
+     * early refreshes of one dictionary. A negative value turns early refreshes off.
+     */
+    @ConfField(mutable = true)
+    public static int dictionary_node_resync_min_interval_second = 30;
+
     /*
      * Replication config
      */
