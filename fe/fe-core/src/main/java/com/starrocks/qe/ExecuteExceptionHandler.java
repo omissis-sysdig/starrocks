@@ -66,6 +66,11 @@ public class ExecuteExceptionHandler {
 
     private static final Set<String> SCHEMA_NOT_MATCH_ERROR = ImmutableSet.of("invalid field name");
 
+    // A CN switched to a newer dictionary version after the FE planned the query. A new plan uses the new version.
+    // "verison" is the BE spelling; keep "version" in case the BE fixes it.
+    private static final Set<String> DICTIONARY_VERSION_NOT_FOUND_ERROR =
+            ImmutableSet.of("can not found dictionary by verison", "can not found dictionary by version");
+
     public static void handle(Exception e, RetryContext context) throws Exception {
         if (e instanceof RemoteFileNotFoundException) {
             handleRemoteFileNotFound((RemoteFileNotFoundException) e, context);
@@ -343,6 +348,12 @@ public class ExecuteExceptionHandler {
         String msg = e.getMessage();
         if (context.parsedStmt instanceof QueryStatement) {
             for (String errMsg : SCHEMA_NOT_MATCH_ERROR) {
+                if (msg.contains(errMsg)) {
+                    rebuildExecPlan(e, context);
+                    return;
+                }
+            }
+            for (String errMsg : DICTIONARY_VERSION_NOT_FOUND_ERROR) {
                 if (msg.contains(errMsg)) {
                     rebuildExecPlan(e, context);
                     return;

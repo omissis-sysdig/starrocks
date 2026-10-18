@@ -143,4 +143,36 @@ public class ExecuteExceptionHandlerTest extends PlanTestBase {
                 new IllegalStateException("unrelated"), retryContext));
         Assertions.assertEquals(execPlan, retryContext.getExecPlan());
     }
+
+    @Test
+    public void testRetryOnDictionaryVersionNotFound() throws Exception {
+        String sql = "select * from t0";
+        StatementBase statementBase = SqlParser.parse(sql, connectContext.getSessionVariable()).get(0);
+        // The text a CN returns when it already switched to a newer dictionary version, also with the typo fixed.
+        String[] messages = {
+                "open dictionary expression failed can not found dictionary by verison: 98101, "
+                        + "dictionary maybe dropped or updated, dictionary id: 5 backend [id=24305]",
+                "open dictionary expression failed can not found dictionary by version: 98101, "
+                        + "dictionary maybe dropped or updated, dictionary id: 5 backend [id=24305]"};
+        for (String message : messages) {
+            ExecPlan execPlan = getExecPlan(sql);
+            ExecuteExceptionHandler.RetryContext retryContext =
+                    new ExecuteExceptionHandler.RetryContext(0, execPlan, connectContext, statementBase);
+            ExceptionChecker.expectThrowsNoException(
+                    () -> ExecuteExceptionHandler.handle(new StarRocksException(message), retryContext));
+            Assertions.assertNotEquals(retryContext.getExecPlan(), execPlan);
+        }
+    }
+
+    @Test
+    public void testNoRetryOnOtherDictionaryError() throws Exception {
+        String sql = "select * from t0";
+        StatementBase statementBase = SqlParser.parse(sql, connectContext.getSessionVariable()).get(0);
+        ExecPlan execPlan = getExecPlan(sql);
+        ExecuteExceptionHandler.RetryContext retryContext =
+                new ExecuteExceptionHandler.RetryContext(0, execPlan, connectContext, statementBase);
+        Assertions.assertThrows(StarRocksException.class, () -> ExecuteExceptionHandler.handle(
+                new StarRocksException("open dictionary expression failed, there is no cache for dictionary: 5"),
+                retryContext));
+    }
 }
