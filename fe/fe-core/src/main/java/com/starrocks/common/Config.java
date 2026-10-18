@@ -4425,10 +4425,17 @@ public class Config extends ConfigBase {
     /**
      * The leader refreshes a dictionary early when a node restarts, joins, or missed the last commit,
      * because that node has no copy of the current version. This is the shortest time between two such
-     * early refreshes of one dictionary. A negative value turns early refreshes off.
+     * early refreshes of one dictionary. A negative value turns early refreshes off. Early refreshes also
+     * run for a dictionary with no automatic refresh, so its content can change at that time.
      */
     @ConfField(mutable = true)
     public static int dictionary_node_resync_min_interval_second = 30;
+
+    /**
+     * If a node still has no copy after an early refresh, the wait before the next one doubles, up to this time.
+     */
+    @ConfField(mutable = true)
+    public static int dictionary_node_resync_max_interval_second = 1800;
 
     /*
      * Replication config
