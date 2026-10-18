@@ -22,11 +22,15 @@ import com.starrocks.persist.EditLog;
 import com.starrocks.persist.OperationType;
 import com.starrocks.persist.UpdateDictionaryMgrLog;
 import com.starrocks.proto.PProcessDictionaryCacheRequest;
+import com.starrocks.proto.PProcessDictionaryCacheRequestType;
 import com.starrocks.proto.PProcessDictionaryCacheResult;
+import com.starrocks.proto.StatusPB;
+import com.starrocks.rpc.BackendServiceClient;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.CreateDictionaryStmt;
 import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TNetworkAddress;
+import com.starrocks.thrift.TStatusCode;
 import com.starrocks.utframe.UtFrameUtils;
 import mockit.Mock;
 import mockit.MockUp;
@@ -40,6 +44,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
@@ -484,7 +490,8 @@ public class DictionaryMgrEditLogTest {
             @Mock
             public static Pair<Boolean, String> processDictionaryCacheInteranl(PProcessDictionaryCacheRequest request,
                                                                                List<TNetworkAddress> beNodes,
-                                                                               List<PProcessDictionaryCacheResult> results) {
+                                                                               List<PProcessDictionaryCacheResult> results,
+                                                                               List<TNetworkAddress> failedNodes) {
                 // Simulate successful result
                 return Pair.create(false, "");
             }
@@ -757,6 +764,147 @@ public class DictionaryMgrEditLogTest {
         Assertions.assertEquals(Dictionary.DictionaryState.CANCELLED, followerDictionary.getState());
         String followerErrorMsg = followerDictionary.getRuntimeErrMsg();
         Assertions.assertEquals(errorMessage, followerErrorMsg);
+    }
+
+    // ========== A node that fails during a refresh ==========
+
+    private static final TNetworkAddress NODE_A = new TNetworkAddress("127.0.0.1", 8060);
+    private static final TNetworkAddress NODE_B = new TNetworkAddress("127.0.0.2", 8060);
+    private static final TNetworkAddress NODE_C = new TNetworkAddress("127.0.0.3", 8060);
+
+    // Three nodes. Node B fails the request types in failOnB, and every node fails the request types in failOnAll.
+    private void mockThreeNodes(Set<PProcessDictionaryCacheRequestType> failOnB,
+                                Set<PProcessDictionaryCacheRequestType> failOnAll) {
+        new MockUp<DictionaryMgr>() {
+            @Mock
+            public void fillBackendsOrComputeNodes(List<TNetworkAddress> nodes) {
+                nodes.add(NODE_A);
+                nodes.add(NODE_B);
+                nodes.add(NODE_C);
+            }
+
+            @Mock
+            public Pair<Boolean, String> processDictionaryCacheInteranl(PProcessDictionaryCacheRequest request,
+                                                                        List<TNetworkAddress> beNodes,
+                                                                        List<PProcessDictionaryCacheResult> results,
+                                                                        List<TNetworkAddress> failedNodes) {
+                if (failOnAll.contains(request.type)) {
+                    failedNodes.addAll(beNodes);
+                    return Pair.create(true, "all nodes failed");
+                }
+                if (failOnB.contains(request.type) && beNodes.contains(NODE_B)) {
+                    failedNodes.add(NODE_B);
+                    return Pair.create(true, "node B restarted");
+                }
+                return Pair.create(false, "");
+            }
+        };
+    }
+
+    private Dictionary createRefreshingDictionary(String name, boolean ignoreFailedRefresh) throws Exception {
+        Map<String, String> properties = new HashMap<>();
+        properties.put("dictionary_warm_up", "false");
+        properties.put("dictionary_ignore_failed_refresh", String.valueOf(ignoreFailedRefresh));
+        masterDictionaryMgr.createDictionary(createTestDictionaryStmt(name, properties), TEST_CATALOG_NAME, TEST_DB_NAME);
+        Dictionary dictionary = masterDictionaryMgr.getDictionaryByName(name);
+        dictionary.setRefreshing(System.currentTimeMillis());
+        return dictionary;
+    }
+
+    @Test
+    public void testRefreshGoesOnWhenBeginFailsOnOneNode() throws Exception {
+        mockThreeNodes(Set.of(PProcessDictionaryCacheRequestType.BEGIN), Set.of());
+        Dictionary dictionary = createRefreshingDictionary("begin_fails_on_one_node", false);
+        long txnId = masterDictionaryMgr.getAndIncrementTxnIdUnlocked();
+        DictionaryMgr.RefreshDictionaryCacheWorker worker =
+                masterDictionaryMgr.new RefreshDictionaryCacheWorker(dictionary, txnId);
+
+        worker.begin();
+        worker.commit();
+        worker.finish();
+
+        Assertions.assertEquals(Lists.newArrayList(NODE_A, NODE_C), worker.getBeNodes());
+        Assertions.assertEquals(Dictionary.DictionaryState.FINISHED, dictionary.getState());
+        Assertions.assertEquals(txnId, dictionary.getLastSuccessVersion());
+    }
+
+    @Test
+    public void testRefreshGoesOnWhenCommitFailsOnOneNode() throws Exception {
+        // A failed COMMIT used to set CANCELLED, even with dictionary_ignore_failed_refresh.
+        mockThreeNodes(Set.of(PProcessDictionaryCacheRequestType.COMMIT), Set.of());
+        Dictionary dictionary = createRefreshingDictionary("commit_fails_on_one_node", true);
+        long txnId = masterDictionaryMgr.getAndIncrementTxnIdUnlocked();
+        DictionaryMgr.RefreshDictionaryCacheWorker worker =
+                masterDictionaryMgr.new RefreshDictionaryCacheWorker(dictionary, txnId);
+
+        worker.begin();
+        worker.commit();
+        worker.finish();
+
+        Assertions.assertEquals(Lists.newArrayList(NODE_A, NODE_C), worker.getBeNodes());
+        Assertions.assertEquals(Dictionary.DictionaryState.FINISHED, dictionary.getState());
+        Assertions.assertEquals(txnId, dictionary.getLastSuccessVersion());
+    }
+
+    // Runs the real request loop. Only the RPC to the node is mocked. Node B fails with an error status.
+    private List<TNetworkAddress> mockNodeRpc(List<TNetworkAddress> calledNodes) {
+        new MockUp<BackendServiceClient>() {
+            @Mock
+            public Future<PProcessDictionaryCacheResult> processDictionaryCache(
+                    TNetworkAddress address, PProcessDictionaryCacheRequest request) {
+                calledNodes.add(address);
+                PProcessDictionaryCacheResult result = new PProcessDictionaryCacheResult();
+                result.status = new StatusPB();
+                result.status.statusCode = NODE_B.equals(address) ? TStatusCode.INTERNAL_ERROR.getValue()
+                        : TStatusCode.OK.getValue();
+                result.status.errorMsgs = NODE_B.equals(address) ? List.of("node B restarted") : List.of();
+                return CompletableFuture.completedFuture(result);
+            }
+        };
+        return calledNodes;
+    }
+
+    @Test
+    public void testRequestLoopReachesNodesAfterTheFailedOne() {
+        List<TNetworkAddress> calledNodes = mockNodeRpc(Lists.newArrayList());
+        List<TNetworkAddress> failedNodes = Lists.newArrayList();
+        List<PProcessDictionaryCacheResult> results = Lists.newArrayList();
+
+        Pair<Boolean, String> ret = DictionaryMgr.processDictionaryCacheInteranl(new PProcessDictionaryCacheRequest(),
+                Lists.newArrayList(NODE_A, NODE_B, NODE_C), results, failedNodes);
+
+        Assertions.assertTrue(ret.first);
+        Assertions.assertEquals("node B restarted", ret.second);
+        Assertions.assertEquals(Lists.newArrayList(NODE_A, NODE_B, NODE_C), calledNodes);
+        Assertions.assertEquals(Lists.newArrayList(NODE_B), failedNodes);
+        Assertions.assertEquals(2, results.size());
+    }
+
+    @Test
+    public void testRequestLoopStopsAtTheFailedNodeWithoutAFailedList() {
+        List<TNetworkAddress> calledNodes = mockNodeRpc(Lists.newArrayList());
+
+        Pair<Boolean, String> ret = DictionaryMgr.processDictionaryCacheInteranl(new PProcessDictionaryCacheRequest(),
+                Lists.newArrayList(NODE_A, NODE_B, NODE_C), null);
+
+        Assertions.assertTrue(ret.first);
+        Assertions.assertEquals(Lists.newArrayList(NODE_A, NODE_B), calledNodes);
+    }
+
+    @Test
+    public void testRefreshIsCancelledWhenCommitFailsOnAllNodes() throws Exception {
+        mockThreeNodes(Set.of(), Set.of(PProcessDictionaryCacheRequestType.COMMIT));
+        Dictionary dictionary = createRefreshingDictionary("commit_fails_on_all_nodes", true);
+        long txnId = masterDictionaryMgr.getAndIncrementTxnIdUnlocked();
+        DictionaryMgr.RefreshDictionaryCacheWorker worker =
+                masterDictionaryMgr.new RefreshDictionaryCacheWorker(dictionary, txnId);
+
+        worker.begin();
+        worker.commit();
+        worker.finish();
+
+        Assertions.assertEquals(Dictionary.DictionaryState.CANCELLED, dictionary.getState());
+        Assertions.assertEquals("all nodes failed", dictionary.getRuntimeErrMsg());
     }
 }
 

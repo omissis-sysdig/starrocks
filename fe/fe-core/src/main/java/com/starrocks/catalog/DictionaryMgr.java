@@ -180,30 +180,60 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
     public static Pair<Boolean, String> processDictionaryCacheInteranl(PProcessDictionaryCacheRequest request,
                                                                        List<TNetworkAddress> beNodes,
                                                                        List<PProcessDictionaryCacheResult> results) {
+        return processDictionaryCacheInteranl(request, beNodes, results, null);
+    }
+
+    // If failedNodes is null, the first failed node stops the loop. If not, the failed nodes go into failedNodes,
+    // the other nodes still get the request, and the first error is returned.
+    public static Pair<Boolean, String> processDictionaryCacheInteranl(PProcessDictionaryCacheRequest request,
+                                                                       List<TNetworkAddress> beNodes,
+                                                                       List<PProcessDictionaryCacheResult> results,
+                                                                       List<TNetworkAddress> failedNodes) {
+        Pair<Boolean, String> firstError = null;
         for (TNetworkAddress address : beNodes) {
-            PProcessDictionaryCacheResult result = null;
-            try {
-                Future<PProcessDictionaryCacheResult> future =
-                        BackendServiceClient.getInstance().processDictionaryCache(address, request);
-                result = future.get();
-            } catch (Exception e) {
-                LOG.warn(" processDictionaryCache failed in: " + address + " rpc error :" + e.getMessage());
-                return new Pair<>(true, e.getMessage());
+            Pair<Boolean, String> ret = processDictionaryCacheOnNode(request, address, results);
+            if (!ret.first) {
+                continue;
             }
-
-            TStatusCode code = TStatusCode.findByValue(result.status.statusCode);
-            if (code != TStatusCode.OK) {
-                LOG.warn(" processDictionaryCache failed in: " + address + " err msg " + result.status.errorMsgs);
-                String errMsg = result.status.errorMsgs.size() == 0 ? "" : result.status.errorMsgs.get(0);
-                return new Pair<>(true, errMsg);
+            if (failedNodes == null) {
+                return ret;
             }
-
-            if (results != null) {
-                results.add(result);
+            failedNodes.add(address);
+            if (firstError == null) {
+                firstError = ret;
             }
+        }
+        if (firstError != null) {
+            return firstError;
         }
         LOG.info("finish processDictionaryCache dictionary id: {}, request type: {}",
                 request.dictId, request.txnId, request.type);
+        return new Pair<>(false, "");
+    }
+
+    private static Pair<Boolean, String> processDictionaryCacheOnNode(PProcessDictionaryCacheRequest request,
+                                                                      TNetworkAddress address,
+                                                                      List<PProcessDictionaryCacheResult> results) {
+        PProcessDictionaryCacheResult result = null;
+        try {
+            Future<PProcessDictionaryCacheResult> future =
+                    BackendServiceClient.getInstance().processDictionaryCache(address, request);
+            result = future.get();
+        } catch (Exception e) {
+            LOG.warn(" processDictionaryCache failed in: " + address + " rpc error :" + e.getMessage());
+            return new Pair<>(true, e.getMessage());
+        }
+
+        TStatusCode code = TStatusCode.findByValue(result.status.statusCode);
+        if (code != TStatusCode.OK) {
+            LOG.warn(" processDictionaryCache failed in: " + address + " err msg " + result.status.errorMsgs);
+            String errMsg = result.status.errorMsgs.size() == 0 ? "" : result.status.errorMsgs.get(0);
+            return new Pair<>(true, errMsg);
+        }
+
+        if (results != null) {
+            results.add(result);
+        }
         return new Pair<>(false, "");
     }
 
@@ -732,16 +762,37 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
             }
         }
 
-        private void begin() {
+        protected void begin() {
             Preconditions.checkState(!error);
             PProcessDictionaryCacheRequest request = new PProcessDictionaryCacheRequest();
             request.dictId = dictionary.getDictionaryId();
             request.txnId = txnId;
             request.type = PProcessDictionaryCacheRequestType.BEGIN;
 
-            Pair<Boolean, String> ret = DictionaryMgr.processDictionaryCacheInteranl(request, beNodes, null);
-            error = ret.first;
-            errMsg = ret.second;
+            processOnAllNodes(request);
+        }
+
+        // One node that fails, for example a CN that restarts, must not fail the refresh for all nodes.
+        // The failed nodes are left out of the rest of this refresh. The refresh fails only if no node is left.
+        private void processOnAllNodes(PProcessDictionaryCacheRequest request) {
+            List<TNetworkAddress> failedNodes = Lists.newArrayList();
+            Pair<Boolean, String> ret =
+                    DictionaryMgr.processDictionaryCacheInteranl(request, beNodes, null, failedNodes);
+            if (!ret.first) {
+                return;
+            }
+            if (failedNodes.size() >= beNodes.size()) {
+                error = true;
+                errMsg = ret.second;
+                return;
+            }
+            LOG.warn("dictionary {} txn {}: {} failed on nodes {}, go on with the other nodes, first error: {}",
+                    dictionary.getDictionaryName(), txnId, request.type, failedNodes, ret.second);
+            beNodes.removeAll(failedNodes);
+        }
+
+        protected List<TNetworkAddress> getBeNodes() {
+            return beNodes;
         }
 
         protected void commit() {
@@ -760,9 +811,7 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
             request.txnId = txnId;
             request.type = PProcessDictionaryCacheRequestType.COMMIT;
 
-            Pair<Boolean, String> ret = DictionaryMgr.processDictionaryCacheInteranl(request, beNodes, null);
-            error = ret.first;
-            errMsg = ret.second;
+            processOnAllNodes(request);
         }
 
         protected void finish() {
