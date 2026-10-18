@@ -360,6 +360,10 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
         return dictionariesMapById.get(dictionariesIdMapByName.get(dictionaryName));
     }
 
+    public Dictionary getDictionaryById(long dictionaryId) {
+        return dictionariesMapById.get(dictionaryId);
+    }
+
     private void resigerUnfinishedToRunningUnlocked(long dictionaryId) {
         Preconditions.checkState(unfinishedRefreshTasks.contains(dictionaryId));
         Preconditions.checkState(!runningRefreshTasks.contains(dictionaryId));

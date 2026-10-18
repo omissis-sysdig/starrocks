@@ -14,6 +14,7 @@
 
 package com.starrocks.qe;
 
+import com.starrocks.catalog.Dictionary;
 import com.starrocks.common.ExceptionChecker;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.InternalErrorCode;
@@ -28,6 +29,8 @@ import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.sql.plan.PlanTestBase;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -174,5 +177,52 @@ public class ExecuteExceptionHandlerTest extends PlanTestBase {
         Assertions.assertThrows(StarRocksException.class, () -> ExecuteExceptionHandler.handle(
                 new StarRocksException("open dictionary expression failed, there is no cache for dictionary: 5"),
                 retryContext));
+    }
+
+    private static Dictionary newCommittingDictionary(long lastSuccessVersion) {
+        Dictionary dictionary = new Dictionary(5, "dict", "t", "default_catalog", "testDb",
+                List.of("k"), List.of("v"), null);
+        dictionary.setFinished(System.currentTimeMillis(), lastSuccessVersion);
+        dictionary.setRefreshing(System.currentTimeMillis());
+        dictionary.setCommitting();
+        return dictionary;
+    }
+
+    @Test
+    public void testWaitForDictionaryRefreshEndsWhenCommitFinishes() throws Exception {
+        Dictionary dictionary = newCommittingDictionary(98100);
+        Thread finisher = new Thread(() -> {
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            dictionary.setFinished(System.currentTimeMillis(), 98101);
+        });
+        finisher.start();
+        long start = System.currentTimeMillis();
+        ExecuteExceptionHandler.waitForDictionaryRefresh(dictionary, 98100, 10000);
+        finisher.join();
+        Assertions.assertTrue(System.currentTimeMillis() - start < 10000);
+        Assertions.assertEquals(98101, dictionary.getLastSuccessVersion());
+    }
+
+    @Test
+    public void testWaitForDictionaryRefreshIsBounded() throws Exception {
+        Dictionary dictionary = newCommittingDictionary(98100);
+        long start = System.currentTimeMillis();
+        ExecuteExceptionHandler.waitForDictionaryRefresh(dictionary, 98100, 100);
+        Assertions.assertTrue(System.currentTimeMillis() - start >= 100);
+        Assertions.assertTrue(dictionary.isRefreshing());
+    }
+
+    @Test
+    public void testWaitForDictionaryRefreshSkipsWhenNotNeeded() throws Exception {
+        long start = System.currentTimeMillis();
+        // The FE already plans with a newer version than the failed query.
+        ExecuteExceptionHandler.waitForDictionaryRefresh(newCommittingDictionary(98101), 98100, 10000);
+        // The FE does not know the dictionary.
+        ExecuteExceptionHandler.waitForDictionaryRefresh(null, 98100, 10000);
+        Assertions.assertTrue(System.currentTimeMillis() - start < 10000);
     }
 }

@@ -4422,6 +4422,13 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true)
     public static int refresh_dictionary_cache_thread_num = 2;
 
+    /**
+     * Before a query that failed on a dictionary version mismatch is planned again, wait at most this long
+     * for the dictionary refresh that caused it to finish. 0 means plan again at once.
+     */
+    @ConfField(mutable = true)
+    public static long dictionary_version_retry_wait_ms = 2000;
+
     /*
      * Replication config
      */

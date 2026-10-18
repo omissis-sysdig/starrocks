@@ -388,6 +388,11 @@ public class Dictionary implements Writable {
                     this.state == DictionaryState.COMMITTING;
     }
 
+    // Synchronized like the setters, so a thread that polls this sees the refresh or replay thread's update.
+    public synchronized boolean isRefreshingFromVersion(long version) {
+        return isRefreshing() && this.lastSuccessVersion == version;
+    }
+
     public synchronized void resetStateBeforeRefresh() {
         if (this.stateBeforeRefresh != null) {
             this.state = this.stateBeforeRefresh;

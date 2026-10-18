@@ -14,7 +14,9 @@
 
 package com.starrocks.qe;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSet;
+import com.starrocks.catalog.Dictionary;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.Config;
 import com.starrocks.common.InternalErrorCode;
@@ -59,6 +61,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class ExecuteExceptionHandler {
 
@@ -70,6 +74,8 @@ public class ExecuteExceptionHandler {
     // "verison" is the BE spelling; keep "version" in case the BE fixes it.
     private static final Set<String> DICTIONARY_VERSION_NOT_FOUND_ERROR =
             ImmutableSet.of("can not found dictionary by verison", "can not found dictionary by version");
+    private static final Pattern DICTIONARY_VERSION_NOT_FOUND_PATTERN =
+            Pattern.compile("can not found dictionary by ver(?:ison|sion): (\\d+),.*dictionary id: (\\d+)");
 
     public static void handle(Exception e, RetryContext context) throws Exception {
         if (e instanceof RemoteFileNotFoundException) {
@@ -355,7 +361,7 @@ public class ExecuteExceptionHandler {
             }
             for (String errMsg : DICTIONARY_VERSION_NOT_FOUND_ERROR) {
                 if (msg.contains(errMsg)) {
-                    rebuildExecPlan(e, context);
+                    handleDictionaryVersionNotFound(e, context);
                     return;
                 }
             }
@@ -366,6 +372,35 @@ public class ExecuteExceptionHandler {
             }
         }
         throw e;
+    }
+
+    // The FE moves the planned version only after the last CN switched, and a follower FE learns it later
+    // from the edit log. Plan again at once and the new plan can carry the same old version.
+    private static void handleDictionaryVersionNotFound(StarRocksException e, RetryContext context)
+            throws Exception {
+        Matcher matcher = DICTIONARY_VERSION_NOT_FOUND_PATTERN.matcher(e.getMessage());
+        if (matcher.find()) {
+            long plannedVersion = Long.parseLong(matcher.group(1));
+            long dictionaryId = Long.parseLong(matcher.group(2));
+            Dictionary dictionary = GlobalStateMgr.getCurrentState().getDictionaryMgr().getDictionaryById(dictionaryId);
+            try {
+                waitForDictionaryRefresh(dictionary, plannedVersion, Config.dictionary_version_retry_wait_ms);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw e;
+            }
+        }
+        rebuildExecPlan(e, context);
+    }
+
+    @VisibleForTesting
+    static void waitForDictionaryRefresh(Dictionary dictionary, long plannedVersion, long timeoutMs)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (dictionary != null && dictionary.isRefreshingFromVersion(plannedVersion)
+                && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20);
+        }
     }
 
     public static class RetryContext {
