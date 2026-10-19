@@ -66,6 +66,7 @@ import com.starrocks.sql.parser.ParsingException;
 import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.system.Backend;
 import com.starrocks.system.ComputeNode;
+import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TStatusCode;
 import com.starrocks.thrift.TUniqueId;
@@ -99,6 +100,14 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
     private Set<Long> unfinishedRefreshTasks = Sets.newHashSet();
     private final Set<Long> runningRefreshTasks = Sets.newHashSet();
 
+    // Leader memory only. For each dictionary: the nodes that committed the current version, with their start time.
+    private final Map<Long, Map<TNetworkAddress, Long>> syncedNodeStartTimes = new HashMap<>();
+    private final Map<Long, Long> lastNodeResyncTime = new HashMap<>();
+    // Early refreshes in a row that did not give every node a copy. Each one doubles the wait before the next.
+    private final Map<Long, Integer> nodeResyncCount = new HashMap<>();
+    // Refreshes that CANCEL REFRESH stopped. They must not go on with the nodes that the cancel did not reach.
+    private final Set<Long> cancelledRefreshTasks = Sets.newHashSet();
+
     private final Lock lock = new ReentrantLock();
 
     private final ExecutorService executor =
@@ -118,6 +127,8 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
 
             List<UpdateDictionaryLog> updateDictionaryLogList = Lists.newArrayList();
             long ts = System.currentTimeMillis();
+            Map<TNetworkAddress, Long> availableNodes =
+                    dictionariesMapById.isEmpty() ? Map.of() : getAvailableNodeStartTimes();
             for (Map.Entry<Long, Dictionary> entry : dictionariesMapById.entrySet()) {
                 long id = entry.getKey();
                 Dictionary dictionary = dictionariesMapById.get(id);
@@ -125,7 +136,9 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
                 if ((dictionary.getNextSchedulableTime() <= System.currentTimeMillis() &&
                         !unfinishedRefreshTasks.contains(id)) ||
                         // follower -> leader when dictionary is refreshing.
-                        (dictionary.isRefreshing() && !runningRefreshTasks.contains(id))) {
+                        (dictionary.isRefreshing() && !runningRefreshTasks.contains(id)) ||
+                        // a node has no copy of the current version
+                        needNodeResyncUnlocked(dictionary, availableNodes, ts)) {
                     UpdateDictionaryLog updateDictionaryLog = new UpdateDictionaryLog(id, ts);
                     updateDictionaryLog.setState(Dictionary.DictionaryState.REFRESHING);
                     updateDictionaryLogList.add(updateDictionaryLog);
@@ -165,45 +178,158 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
     }
 
     public static void fillBackendsOrComputeNodes(List<TNetworkAddress> nodes) {
-        List<Backend> backends = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackends();
+        List<Backend> backends = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getAvailableBackends();
         for (Backend backend : backends) {
             nodes.add(backend.getBrpcAddress());
         }
 
         List<ComputeNode> computeNodes =
-                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getComputeNodes();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getAvailableComputeNodes();
         for (ComputeNode cn : computeNodes) {
             nodes.add(cn.getBrpcAddress());
         }
     }
 
+    // The start time of each available node. A new start time means that the node restarted and lost its cache.
+    public static Map<TNetworkAddress, Long> getAvailableNodeStartTimes() {
+        SystemInfoService clusterInfo = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
+        Map<TNetworkAddress, Long> startTimes = new HashMap<>();
+        for (Backend backend : clusterInfo.getAvailableBackends()) {
+            startTimes.put(backend.getBrpcAddress(), backend.getLastStartTime());
+        }
+        for (ComputeNode cn : clusterInfo.getAvailableComputeNodes()) {
+            startTimes.put(cn.getBrpcAddress(), cn.getLastStartTime());
+        }
+        return startTimes;
+    }
+
+    // True if an available node restarted, joined, or missed the last commit. Queries on that node fail
+    // until the next refresh, so refresh now instead of at the next regular time.
+    boolean needNodeResyncUnlocked(Dictionary dictionary, Map<TNetworkAddress, Long> availableNodes, long now) {
+        long id = dictionary.getDictionaryId();
+        if (Config.dictionary_node_resync_min_interval_second < 0 ||
+                dictionary.getState() != Dictionary.DictionaryState.FINISHED ||
+                unfinishedRefreshTasks.contains(id)) {
+            return false;
+        }
+        Map<TNetworkAddress, Long> synced = syncedNodeStartTimes.get(id);
+        if (synced == null) {
+            // No record on a new leader. Take the nodes of now as the base, and do not refresh for that.
+            syncedNodeStartTimes.put(id, new HashMap<>(availableNodes));
+            return false;
+        }
+        TNetworkAddress missing = null;
+        for (Map.Entry<TNetworkAddress, Long> node : availableNodes.entrySet()) {
+            if (!node.getValue().equals(synced.get(node.getKey()))) {
+                missing = node.getKey();
+                break;
+            }
+        }
+        if (missing == null) {
+            lastNodeResyncTime.remove(id);
+            nodeResyncCount.remove(id);
+            return false;
+        }
+        // A node that fails every refresh must not cause a full refresh every few seconds.
+        int count = nodeResyncCount.getOrDefault(id, 0);
+        Long lastResync = lastNodeResyncTime.get(id);
+        if (lastResync != null && now - lastResync < nodeResyncWaitMs(count)) {
+            return false;
+        }
+        LOG.info("refresh dictionary {} because node {} has no copy of version {}, early refresh {} in a row",
+                dictionary.getDictionaryName(), missing, dictionary.getLastSuccessVersion(), count + 1);
+        lastNodeResyncTime.put(id, now);
+        nodeResyncCount.put(id, count + 1);
+        return true;
+    }
+
+    private static long nodeResyncWaitMs(int count) {
+        long minMs = Config.dictionary_node_resync_min_interval_second * 1000L;
+        long maxMs = Math.max(minMs, Config.dictionary_node_resync_max_interval_second * 1000L);
+        return Math.min(minMs << Math.min(Math.max(count - 1, 0), 20), maxMs);
+    }
+
+    private void recordSyncedNodes(long dictionaryId, List<TNetworkAddress> committedNodes,
+                                   Map<TNetworkAddress, Long> nodeStartTimes) {
+        Map<TNetworkAddress, Long> synced = new HashMap<>();
+        for (TNetworkAddress node : committedNodes) {
+            // A node with no start time is left out, so the next check refreshes it.
+            Long startTime = nodeStartTimes.get(node);
+            if (startTime != null) {
+                synced.put(node, startTime);
+            }
+        }
+        lock.lock();
+        try {
+            if (dictionariesMapById.containsKey(dictionaryId)) {
+                syncedNodeStartTimes.put(dictionaryId, synced);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    Map<TNetworkAddress, Long> getSyncedNodeStartTimes(long dictionaryId) {
+        return syncedNodeStartTimes.get(dictionaryId);
+    }
+
     public static Pair<Boolean, String> processDictionaryCacheInteranl(PProcessDictionaryCacheRequest request,
                                                                        List<TNetworkAddress> beNodes,
                                                                        List<PProcessDictionaryCacheResult> results) {
+        return processDictionaryCacheInteranl(request, beNodes, results, null);
+    }
+
+    // If failedNodes is null, the first failed node stops the loop. If not, the failed nodes go into failedNodes,
+    // the other nodes still get the request, and the first error is returned.
+    public static Pair<Boolean, String> processDictionaryCacheInteranl(PProcessDictionaryCacheRequest request,
+                                                                       List<TNetworkAddress> beNodes,
+                                                                       List<PProcessDictionaryCacheResult> results,
+                                                                       List<TNetworkAddress> failedNodes) {
+        Pair<Boolean, String> firstError = null;
         for (TNetworkAddress address : beNodes) {
-            PProcessDictionaryCacheResult result = null;
-            try {
-                Future<PProcessDictionaryCacheResult> future =
-                        BackendServiceClient.getInstance().processDictionaryCache(address, request);
-                result = future.get();
-            } catch (Exception e) {
-                LOG.warn(" processDictionaryCache failed in: " + address + " rpc error :" + e.getMessage());
-                return new Pair<>(true, e.getMessage());
+            Pair<Boolean, String> ret = processDictionaryCacheOnNode(request, address, results);
+            if (!ret.first) {
+                continue;
             }
-
-            TStatusCode code = TStatusCode.findByValue(result.status.statusCode);
-            if (code != TStatusCode.OK) {
-                LOG.warn(" processDictionaryCache failed in: " + address + " err msg " + result.status.errorMsgs);
-                String errMsg = result.status.errorMsgs.size() == 0 ? "" : result.status.errorMsgs.get(0);
-                return new Pair<>(true, errMsg);
+            if (failedNodes == null) {
+                return ret;
             }
-
-            if (results != null) {
-                results.add(result);
+            failedNodes.add(address);
+            if (firstError == null) {
+                firstError = ret;
             }
         }
-        LOG.info("finish processDictionaryCache dictionary id: {}, request type: {}",
+        if (firstError != null) {
+            return firstError;
+        }
+        LOG.info("finish processDictionaryCache dictionary id: {}, txn id: {}, request type: {}",
                 request.dictId, request.txnId, request.type);
+        return new Pair<>(false, "");
+    }
+
+    private static Pair<Boolean, String> processDictionaryCacheOnNode(PProcessDictionaryCacheRequest request,
+                                                                      TNetworkAddress address,
+                                                                      List<PProcessDictionaryCacheResult> results) {
+        PProcessDictionaryCacheResult result = null;
+        try {
+            Future<PProcessDictionaryCacheResult> future =
+                    BackendServiceClient.getInstance().processDictionaryCache(address, request);
+            result = future.get();
+        } catch (Exception e) {
+            LOG.warn(" processDictionaryCache failed in: " + address + " rpc error :" + e.getMessage());
+            return new Pair<>(true, e.getMessage());
+        }
+
+        TStatusCode code = TStatusCode.findByValue(result.status.statusCode);
+        if (code != TStatusCode.OK) {
+            LOG.warn(" processDictionaryCache failed in: " + address + " err msg " + result.status.errorMsgs);
+            String errMsg = result.status.errorMsgs.size() == 0 ? "" : result.status.errorMsgs.get(0);
+            return new Pair<>(true, errMsg);
+        }
+
+        if (results != null) {
+            results.add(result);
+        }
         return new Pair<>(false, "");
     }
 
@@ -257,6 +383,10 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
         dictionariesMapById.remove(dictionary.getDictionaryId());
         dictionariesIdMapByName.remove(dictionary.getDictionaryName());
         unfinishedRefreshTasks.remove(dictionary.getDictionaryId());
+        syncedNodeStartTimes.remove(dictionary.getDictionaryId());
+        lastNodeResyncTime.remove(dictionary.getDictionaryId());
+        nodeResyncCount.remove(dictionary.getDictionaryId());
+        cancelledRefreshTasks.remove(dictionary.getDictionaryId());
     }
 
     public void replayDropDictionary(String dictionaryName) {
@@ -299,6 +429,9 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
         lock.lock();
         try {
             Dictionary dictionary = getDictionaryByName(dictionaryName);
+            if (unfinishedRefreshTasks.contains(dictionary.getDictionaryId())) {
+                cancelledRefreshTasks.add(dictionary.getDictionaryId());
+            }
             clearDictionaryCache(dictionary, true);
         } finally {
             lock.unlock();
@@ -351,6 +484,16 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
         try {
             runningRefreshTasks.remove(dictionaryId);
             unfinishedRefreshTasks.remove(dictionaryId);
+            cancelledRefreshTasks.remove(dictionaryId);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private boolean isRefreshCancelled(long dictionaryId) {
+        lock.lock();
+        try {
+            return cancelledRefreshTasks.contains(dictionaryId);
         } finally {
             lock.unlock();
         }
@@ -609,6 +752,7 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
         private Dictionary dictionary;
         private long txnId;
         private List<TNetworkAddress> beNodes = Lists.newArrayList();
+        private Map<TNetworkAddress, Long> nodeStartTimes = new HashMap<>();
         private boolean error;
         private String errMsg;
 
@@ -622,6 +766,7 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
 
         private void initializeBeNodesAddress() {
             fillBackendsOrComputeNodes(this.beNodes);
+            this.nodeStartTimes = getAvailableNodeStartTimes();
         }
 
         protected void setError(boolean isError, String errMsg) {
@@ -732,16 +877,41 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
             }
         }
 
-        private void begin() {
+        protected void begin() {
             Preconditions.checkState(!error);
             PProcessDictionaryCacheRequest request = new PProcessDictionaryCacheRequest();
             request.dictId = dictionary.getDictionaryId();
             request.txnId = txnId;
             request.type = PProcessDictionaryCacheRequestType.BEGIN;
 
-            Pair<Boolean, String> ret = DictionaryMgr.processDictionaryCacheInteranl(request, beNodes, null);
-            error = ret.first;
-            errMsg = ret.second;
+            // With dictionary_ignore_failed_refresh, a failed refresh keeps the old version on every node.
+            // A node left out here would keep the old version while queries ask it for the new one.
+            processOnAllNodes(request, !dictionary.getIgnoreFailedRefresh());
+        }
+
+        // One node that fails, for example a CN that restarts, must not fail the refresh for all nodes.
+        // The failed nodes are left out of the rest of this refresh. The refresh fails if no node is left,
+        // if the caller does not allow to leave nodes out, or if CANCEL REFRESH stopped it.
+        private void processOnAllNodes(PProcessDictionaryCacheRequest request, boolean leaveOutFailedNodes) {
+            List<TNetworkAddress> failedNodes = Lists.newArrayList();
+            Pair<Boolean, String> ret =
+                    DictionaryMgr.processDictionaryCacheInteranl(request, beNodes, null, failedNodes);
+            if (!ret.first) {
+                return;
+            }
+            if (!leaveOutFailedNodes || failedNodes.size() >= beNodes.size() ||
+                    isRefreshCancelled(dictionary.getDictionaryId())) {
+                error = true;
+                errMsg = ret.second;
+                return;
+            }
+            LOG.warn("dictionary {} txn {}: {} failed on nodes {}, go on with the other nodes, first error: {}",
+                    dictionary.getDictionaryName(), txnId, request.type, failedNodes, ret.second);
+            beNodes.removeAll(failedNodes);
+        }
+
+        protected List<TNetworkAddress> getBeNodes() {
+            return beNodes;
         }
 
         protected void commit() {
@@ -760,9 +930,8 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
             request.txnId = txnId;
             request.type = PProcessDictionaryCacheRequestType.COMMIT;
 
-            Pair<Boolean, String> ret = DictionaryMgr.processDictionaryCacheInteranl(request, beNodes, null);
-            error = ret.first;
-            errMsg = ret.second;
+            // Nodes that committed already serve the new version, so the refresh cannot roll back from here.
+            processOnAllNodes(request, true);
         }
 
         protected void finish() {
@@ -796,6 +965,9 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
 
             GlobalStateMgr.getCurrentState().getEditLog().logModifyDictionaryMgr(
                     new UpdateDictionaryMgrLog(Lists.newArrayList(updateDictionaryLog)), walApplier);
+            if (!error) {
+                recordSyncedNodes(dictionary.getDictionaryId(), beNodes, nodeStartTimes);
+            }
             unresigerRunningAndUnfinised(dictionary.getDictionaryId());
         }
 
