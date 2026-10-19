@@ -360,6 +360,16 @@ public class DictionaryMgr implements Writable, GsonPostProcessable {
         return dictionariesMapById.get(dictionariesIdMapByName.get(dictionaryName));
     }
 
+    // Called from query threads, so take the lock: the map is a plain HashMap.
+    public Dictionary getDictionaryById(long dictionaryId) {
+        lock.lock();
+        try {
+            return dictionariesMapById.get(dictionaryId);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private void resigerUnfinishedToRunningUnlocked(long dictionaryId) {
         Preconditions.checkState(unfinishedRefreshTasks.contains(dictionaryId));
         Preconditions.checkState(!runningRefreshTasks.contains(dictionaryId));
