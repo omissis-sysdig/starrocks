@@ -57,6 +57,9 @@ static bool use_cloud_native_pk_index(const TabletMetadata& metadata) {
            metadata.persistent_index_type() == PersistentIndexTypePB::CLOUD_NATIVE;
 }
 
+// is_missing_rssid_error matches on this text, so keep it in the error that get_column_values returns.
+static constexpr std::string_view kMissingRssidMessage = "no exist";
+
 UpdateManager::UpdateManager(std::shared_ptr<LocationProvider> location_provider, MemTracker* mem_tracker)
         : _index_cache(std::numeric_limits<size_t>::max()),
           _update_state_cache(std::numeric_limits<size_t>::max()),
@@ -282,6 +285,45 @@ StatusOr<IndexEntry*> UpdateManager::rebuild_primary_index(
     LOG(INFO) << "rebuild tablet: " << metadata->id() << " primary index, version: " << base_version;
     unload_and_remove_primary_index(metadata->id());
     return prepare_primary_index(metadata, builder, base_version, new_version, guard);
+}
+
+bool UpdateManager::is_missing_rssid_error(const Status& st) {
+    return st.is_cancelled() && st.message().find("rowset_segment_id") != std::string_view::npos &&
+           st.message().find(kMissingRssidMessage) != std::string_view::npos;
+}
+
+bool UpdateManager::request_pk_index_rebuild(int64_t tablet_id, int64_t base_version) {
+    std::lock_guard<std::mutex> lg(_pk_index_rebuild_mutex);
+    auto it = _pk_index_auto_rebuilt.find(tablet_id);
+    if (it != _pk_index_auto_rebuilt.end() && it->second == base_version) {
+        LOG(WARNING) << "PK index of tablet " << tablet_id << " was already rebuilt from base version " << base_version
+                     << " and the publish still reads a missing segment, not rebuilding again";
+        return false;
+    }
+    if (_pk_index_rebuild_requests.insert_or_assign(tablet_id, base_version).second) {
+        LOG(WARNING) << "PK index of tablet " << tablet_id << " points at a missing segment, the next publish from base"
+                     << " version " << base_version << " rebuilds it";
+    }
+    return true;
+}
+
+bool UpdateManager::take_pk_index_rebuild_request(int64_t tablet_id, int64_t base_version) {
+    std::lock_guard<std::mutex> lg(_pk_index_rebuild_mutex);
+    auto it = _pk_index_rebuild_requests.find(tablet_id);
+    if (it == _pk_index_rebuild_requests.end()) {
+        return false;
+    }
+    const bool match = it->second == base_version;
+    // A request for another base version is stale: that version was published or abandoned.
+    _pk_index_rebuild_requests.erase(it);
+    if (!match) {
+        return false;
+    }
+    _pk_index_auto_rebuilt[tablet_id] = base_version;
+    StarRocksMetrics::instance()->primary_key_index_auto_rebuild_total.increment(1);
+    LOG(WARNING) << "Rebuilding PK index of tablet " << tablet_id << " from base version " << base_version
+                 << " because a publish read a missing segment";
+    return true;
 }
 
 // Plan for interleaving del files with segments during a primary-key publish. Per del file:
@@ -1912,8 +1954,9 @@ Status UpdateManager::get_column_values(const RowsetUpdateStateParams& params, c
 
         if (params.container.rssid_to_file().count(rssid) == 0) {
             // It may happen when partial update state was loaded with old tablet meta
-            return Status::Cancelled(fmt::format("tablet id {} version {} rowset_segment_id {} no exist",
-                                                 params.metadata->id(), params.metadata->version(), rssid));
+            return Status::Cancelled(fmt::format("tablet id {} version {} rowset_segment_id {} {}",
+                                                 params.metadata->id(), params.metadata->version(), rssid,
+                                                 kMissingRssidMessage));
         }
         // pass the actual segment_id to properly handle DCG reading
         RETURN_IF_ERROR(fetch_values_from_segment(params.container.rssid_to_file().at(rssid), rssid,
@@ -2155,6 +2198,17 @@ Status UpdateManager::light_publish_primary_compaction(const TxnLogPB_OpCompacti
     return Status::OK();
 }
 
+static bool compaction_inputs_have_del_files(const TxnLogPB_OpCompaction& op_compaction,
+                                             const TabletMetadata& metadata) {
+    const auto& inputs = op_compaction.input_rowsets();
+    for (const auto& rowset : metadata.rowsets()) {
+        if (rowset.del_files_size() > 0 && std::find(inputs.begin(), inputs.end(), rowset.id()) != inputs.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 DEFINE_FAIL_POINT(hook_publish_primary_key_tablet_compaction);
 Status UpdateManager::publish_primary_compaction(const TxnLogPB_OpCompaction& op_compaction, int64_t txn_id,
                                                  const TabletMetadataPtr& metadata, const Tablet& tablet,
@@ -2174,9 +2228,12 @@ Status UpdateManager::publish_primary_compaction(const TxnLogPB_OpCompaction& op
         // conflict happens
         return Status::OK();
     }
+    // Read it now: apply_opcompaction removes the input rowsets from |metadata|.
+    const bool inputs_have_dels = compaction_inputs_have_del_files(op_compaction, *metadata);
     if (_use_light_publish_primary_compaction(tablet.tablet_mgr(), op_compaction, tablet.id(), txn_id)) {
-        return light_publish_primary_compaction(op_compaction, txn_id, metadata, tablet, index_entry, builder,
-                                                base_version);
+        RETURN_IF_ERROR(light_publish_primary_compaction(op_compaction, txn_id, metadata, tablet, index_entry, builder,
+                                                         base_version));
+        return _flush_index_before_dropping_dels(inputs_have_dels, metadata, index_entry);
     }
     auto& index = index_entry->value();
     // 1. iterate output rowset, update primary index and generate delvec
@@ -2257,7 +2314,20 @@ Status UpdateManager::publish_primary_compaction(const TxnLogPB_OpCompaction& op
 
     _print_memory_stats();
 
-    return Status::OK();
+    return _flush_index_before_dropping_dels(inputs_have_dels, metadata, index_entry);
+}
+
+Status UpdateManager::_flush_index_before_dropping_dels(bool inputs_have_dels, const TabletMetadataPtr& metadata,
+                                                        IndexEntry* index_entry) {
+    if (!inputs_have_dels || !config::lake_pk_index_flush_before_compacting_dels ||
+        !use_cloud_native_pk_index(*metadata)) {
+        return Status::OK();
+    }
+    // A cold reload replays only rowsets above the last sstable. Once this compaction drops the del
+    // files, their deletes survive only if the memtable that holds them reaches an sstable first.
+    TRACE_COUNTER_SCOPE_LATENCY_US("compaction_flush_index_for_dels_us");
+    return index_entry->value().sync_flush_persistent_index(config::pk_index_memtable_max_wait_flush_timeout_ms *
+                                                            1000);
 }
 
 bool UpdateManager::try_remove_primary_index_cache(uint32_t tablet_id) {
